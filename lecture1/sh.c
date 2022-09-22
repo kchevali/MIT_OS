@@ -34,7 +34,7 @@ struct redircmd {
 };
 
 struct pipecmd {
-  int type;          // |
+  int type;          // |, ;
   struct cmd *left;  // left side of pipe
   struct cmd *right; // right side of pipe
 };
@@ -60,20 +60,14 @@ void run_exec(char *argv[MAXARGS]){
     "/usr/bin/",
   };
 
-  int succeed = 0;
   for(int i = 0; i < 3; i++){
-    if(atmpt_exec(buffer, paths[i], argv)){
-      succeed = 1;
-      break;
-    }
-    // else{
-    //   perror("exec");
-    // }
+    // calls execv, which halts this program if successful
+    atmpt_exec(buffer, paths[i], argv);
   }
-  if(!succeed){
-    fprintf(stderr, "command not found: %s\n", argv[0]);
-    exit(1);
-  }
+
+  // this line is not reachable if atmpt_exec succeeded
+  fprintf(stderr, "command not found: %s\n", argv[0]);
+  exit(1);
 }
 
 // Execute cmd.  Never returns.
@@ -90,11 +84,15 @@ void runcmd(struct cmd *cmd) {
   default:
     fprintf(stderr, "unknown runcmd\n");
     exit(-1);
+    break;
 
   case ' ':
     ecmd = (struct execcmd*)cmd;
-    if(ecmd->argv[0] == 0)
+    // fprintf(stderr, "executing: %s\n", ecmd->argv[0]);
+    if(ecmd->argv[0] == 0){
+      fprintf(stderr, "null command");
       exit(0);
+    }
     run_exec(ecmd->argv);
     break;
 
@@ -140,6 +138,16 @@ void runcmd(struct cmd *cmd) {
       perror("fork");
     }
     wait(&r);
+    break;
+  case ';':
+    pcmd = (struct pipecmd*)cmd;
+    // fprintf(stderr, "left: %s right %s\n", ((struct execcmd*)pcmd->left)->argv[0], ((struct execcmd*)pcmd->right)->argv[0]);
+    if(fork1() == 0){
+      runcmd(pcmd->left);
+    }else{
+      wait(&r);
+      runcmd(pcmd->right);
+    }
     break;
   }    
   exit(0);
@@ -208,10 +216,10 @@ struct cmd* redircmd(struct cmd *subcmd, char *file, int type) {
   return (struct cmd*)cmd;
 }
 
-struct cmd* pipecmd(struct cmd *left, struct cmd *right) {
+struct cmd* pipecmd(struct cmd *left, struct cmd *right, char type) {
   struct pipecmd *cmd = malloc(sizeof(*cmd));
   memset(cmd, 0, sizeof(*cmd));
-  cmd->type = '|';
+  cmd->type = type;
   cmd->left = left;
   cmd->right = right;
   return (struct cmd*)cmd;
@@ -220,7 +228,7 @@ struct cmd* pipecmd(struct cmd *left, struct cmd *right) {
 // Parsing
 
 char whitespace[] = " \t\r\n\v";
-char symbols[] = "<|>\"'`";
+char symbols[] = "<|>\"'`;";
 
 // skips whitespace, finds token start, end (and start of next token if q / eq is specified)
  // return is either 0, a symbol or 'a' for non-symbol
@@ -234,12 +242,12 @@ int gettoken(char **ps, char *es, char **q, char **eq) {
     s++;
   
   // store pointer to first char of token
-  if(q)
-    *q = s;
+  if(q) *q = s;
   
   // get char of token
   ret = *s;
   int quote = 0;
+  int end_quote = *s;
 
   // check if char is a symbol
   switch(*s){
@@ -257,22 +265,35 @@ int gettoken(char **ps, char *es, char **q, char **eq) {
   
   // first char is a symbol
   case '|':
+  case ';':
   case '<':
   case '>':
     s++;
     break;
   // first char is a quote
+  // case '[':
+  // case '(':
+  // case '{':
   case '"':
   case '\'':
   case '`':
-  // fprintf(stderr, "got quote!\n");
-    if(q) (*q)++;
+
+    // fprintf(stderr, "got quote!\n");
+    // if(*s == '{') end_quote = '}';
+    // else if(*s == '[') end_quote = ']';
+    // else if(*s == '(') end_quote = ')';
+
+    do{
+      s++;
+    }while(s < es && strchr(whitespace, *s));
+
+    if(q) *q = s;
     do{
         s++;
         // fprintf(stderr, "scanning: '%c'\n", *s);
-    }while(s < es && *s != ret);
-    if(*s != ret){
-      fprintf(stderr, "unbalanced quote: %c\n", ret);
+    }while(s < es && *s != end_quote);
+    if(*s != end_quote){
+      fprintf(stderr, "unbalanced quote: %c\n", end_quote);
       exit(1);
     }
     ret = 'a';
@@ -302,12 +323,12 @@ int gettoken(char **ps, char *es, char **q, char **eq) {
 }
 
 // skips white space then returns if one of the tokens exist
-int peek_tokens(char **ps, char *es, char *toks) {
+char* peek_tokens(char **ps, char *es, char *toks) {
   char *s = *ps;
   while(s < es && strchr(whitespace, *s))
     s++;
   *ps = s;
-  return *s && strchr(toks, *s);
+  return (*s) ? strchr(toks, *s) : 0;
 }
 
 struct cmd *parseline(char**, char*);
@@ -343,9 +364,10 @@ struct cmd* parseline(char **ps, char *es) {
 
 struct cmd* parsepipe(char **ps, char *es) {
   struct cmd *cmd = parseexec(ps, es);
-  if(peek_tokens(ps, es, "|")){
+  char* type = peek_tokens(ps, es, "|;");
+  if(type){
     gettoken(ps, es, 0, 0);
-    cmd = pipecmd(cmd, parsepipe(ps, es));
+    cmd = pipecmd(cmd, parsepipe(ps, es), *type);
   }
   return cmd;
 }
@@ -379,7 +401,7 @@ struct cmd* parseexec(char **ps, char *es) {
   struct execcmd *cmd = (struct execcmd*)ret;
 
   ret = parseredirs(ret, ps, es);
-  while(!peek_tokens(ps, es, "|")){
+  while(!peek_tokens(ps, es, "|;")){
     if((tok=gettoken(ps, es, &q, &eq)) == 0)
       break;
     // fprintf(stderr, "exec token: '%.*s'\n", (int)(eq - q), q);
