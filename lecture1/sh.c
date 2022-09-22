@@ -78,10 +78,10 @@ void run_exec(char *argv[MAXARGS]){
 
 // Execute cmd.  Never returns.
 void runcmd(struct cmd *cmd) {
-  int p[2], r;
-  struct execcmd *ecmd;
-  struct pipecmd *pcmd;
-  struct redircmd *rcmd;
+  int p[2], r = 0;
+  struct execcmd *ecmd = 0;
+  struct pipecmd *pcmd = 0;
+  struct redircmd *rcmd = 0;
 
   if(cmd == NULL)
     exit(0);
@@ -159,8 +159,8 @@ int main(void) {
   }
 
   static char buf[MAXCHAR];
-  int fd;
-  int r;
+  int fd = 0;
+  int r = 0;
 
   // Read and run input commands.
   while(getcmd(buf, sizeof(buf)) >= 0){
@@ -184,29 +184,21 @@ int main(void) {
 }
 
 int fork1(void) {
-  int pid;
-  
-  pid = fork();
+  int pid = fork();
   if(pid == -1)
     perror("fork");
   return pid;
 }
 
-struct cmd*
-execcmd(void) {
-  struct execcmd *cmd;
-
-  cmd = malloc(sizeof(*cmd));
+struct cmd* execcmd(void) {
+  struct execcmd *cmd = malloc(sizeof(*cmd));
   memset(cmd, 0, sizeof(*cmd));
   cmd->type = ' ';
   return (struct cmd*)cmd;
 }
 
-struct cmd*
-redircmd(struct cmd *subcmd, char *file, int type) {
-  struct redircmd *cmd;
-
-  cmd = malloc(sizeof(*cmd));
+struct cmd* redircmd(struct cmd *subcmd, char *file, int type) {
+  struct redircmd *cmd = malloc(sizeof(*cmd));
   memset(cmd, 0, sizeof(*cmd));
   cmd->type = type;
   cmd->cmd = subcmd;
@@ -216,11 +208,8 @@ redircmd(struct cmd *subcmd, char *file, int type) {
   return (struct cmd*)cmd;
 }
 
-struct cmd*
-pipecmd(struct cmd *left, struct cmd *right) {
-  struct pipecmd *cmd;
-
-  cmd = malloc(sizeof(*cmd));
+struct cmd* pipecmd(struct cmd *left, struct cmd *right) {
+  struct pipecmd *cmd = malloc(sizeof(*cmd));
   memset(cmd, 0, sizeof(*cmd));
   cmd->type = '|';
   cmd->left = left;
@@ -231,47 +220,90 @@ pipecmd(struct cmd *left, struct cmd *right) {
 // Parsing
 
 char whitespace[] = " \t\r\n\v";
-char symbols[] = "<|>";
+char symbols[] = "<|>\"'`";
 
+// skips whitespace, finds token start, end (and start of next token if q / eq is specified)
+ // return is either 0, a symbol or 'a' for non-symbol
 int gettoken(char **ps, char *es, char **q, char **eq) {
-  char *s;
-  int ret;
+  int ret = 0;
   
-  s = *ps;
+  char *s = *ps;
+
+  // skip whitespace
   while(s < es && strchr(whitespace, *s))
     s++;
+  
+  // store pointer to first char of token
   if(q)
     *q = s;
+  
+  // get char of token
   ret = *s;
+  int quote = 0;
+
+  // check if char is a symbol
   switch(*s){
+
+  // not more characters
   case 0:
     break;
+  
+  case ')':
+  case ']':
+  case '}':
+    fprintf(stderr, "unbalanced brackets: '%c'\n", *s);
+    exit(1);
+    break;
+  
+  // first char is a symbol
   case '|':
   case '<':
-    s++;
-    break;
   case '>':
     s++;
     break;
+  // first char is a quote
+  case '"':
+  case '\'':
+  case '`':
+  // fprintf(stderr, "got quote!\n");
+    if(q) (*q)++;
+    do{
+        s++;
+        // fprintf(stderr, "scanning: '%c'\n", *s);
+    }while(s < es && *s != ret);
+    if(*s != ret){
+      fprintf(stderr, "unbalanced quote: %c\n", ret);
+      exit(1);
+    }
+    ret = 'a';
+    quote = 1;
+  break;
+
+  // char is not a symbol
   default:
     ret = 'a';
     while(s < es && !strchr(whitespace, *s) && !strchr(symbols, *s))
       s++;
     break;
   }
+
+  // first char after the token
   if(eq)
     *eq = s;
   
+  // skip whitespace
   while(s < es && strchr(whitespace, *s))
     s++;
+
+  if(quote) s++;
+  // point to first char of second token
   *ps = s;
   return ret;
 }
 
-int peek(char **ps, char *es, char *toks) {
-  char *s;
-  
-  s = *ps;
+// skips white space then returns if one of the tokens exist
+int peek_tokens(char **ps, char *es, char *toks) {
+  char *s = *ps;
   while(s < es && strchr(whitespace, *s))
     s++;
   *ps = s;
@@ -293,14 +325,10 @@ char *mkcopy(char *s, char *es) {
   return c;
 }
 
-struct cmd*
-parsecmd(char *s) {
-  char *es;
-  struct cmd *cmd;
-
-  es = s + strlen(s);
-  cmd = parseline(&s, es);
-  peek(&s, es, "");
+struct cmd* parsecmd(char *s) {
+  char *es = s + strlen(s);
+  struct cmd *cmd = parseline(&s, es);
+  peek_tokens(&s, es, "");
   if(s != es){
     fprintf(stderr, "leftovers: %s\n", s);
     exit(-1);
@@ -308,36 +336,30 @@ parsecmd(char *s) {
   return cmd;
 }
 
-struct cmd*
-parseline(char **ps, char *es) {
-  struct cmd *cmd;
-  cmd = parsepipe(ps, es);
+struct cmd* parseline(char **ps, char *es) {
+  struct cmd *cmd = parsepipe(ps, es);
   return cmd;
 }
 
-struct cmd*
-parsepipe(char **ps, char *es) {
-  struct cmd *cmd;
-
-  cmd = parseexec(ps, es);
-  if(peek(ps, es, "|")){
+struct cmd* parsepipe(char **ps, char *es) {
+  struct cmd *cmd = parseexec(ps, es);
+  if(peek_tokens(ps, es, "|")){
     gettoken(ps, es, 0, 0);
     cmd = pipecmd(cmd, parsepipe(ps, es));
   }
   return cmd;
 }
 
-struct cmd*
-parseredirs(struct cmd *cmd, char **ps, char *es) {
-  int tok;
-  char *q, *eq;
+struct cmd* parseredirs(struct cmd *cmd, char **ps, char *es) {
+  char *q = 0, *eq = 0;
 
-  while(peek(ps, es, "<>")){
-    tok = gettoken(ps, es, 0, 0);
+  while(peek_tokens(ps, es, "<>")){
+    int tok = gettoken(ps, es, 0, 0);
     if(gettoken(ps, es, &q, &eq) != 'a') {
       fprintf(stderr, "missing file for redirection\n");
       exit(-1);
     }
+    // fprintf(stderr, "redir token: '%.*s", (int)(eq - q), q);
     switch(tok){
     case '<':
       cmd = redircmd(cmd, mkcopy(q, eq), '<');
@@ -350,21 +372,17 @@ parseredirs(struct cmd *cmd, char **ps, char *es) {
   return cmd;
 }
 
-struct cmd*
-parseexec(char **ps, char *es) {
-  char *q, *eq;
-  int tok, argc;
-  struct execcmd *cmd;
-  struct cmd *ret;
-  
-  ret = execcmd();
-  cmd = (struct execcmd*)ret;
+struct cmd* parseexec(char **ps, char *es) {
+  char *q = 0, *eq = 0;
+  int tok = 0, argc = 0;
+  struct cmd *ret = execcmd();
+  struct execcmd *cmd = (struct execcmd*)ret;
 
-  argc = 0;
   ret = parseredirs(ret, ps, es);
-  while(!peek(ps, es, "|")){
+  while(!peek_tokens(ps, es, "|")){
     if((tok=gettoken(ps, es, &q, &eq)) == 0)
       break;
+    // fprintf(stderr, "exec token: '%.*s'\n", (int)(eq - q), q);
     if(tok != 'a') {
       fprintf(stderr, "syntax error\n");
       exit(-1);
