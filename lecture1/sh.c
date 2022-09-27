@@ -17,7 +17,7 @@
 // All commands have at least a type. Have looked at the type, the code
 // typically casts the *cmd to some specific cmd type.
 struct cmd {
-  int type;          //  ' ' (exec), | (pipe), '<' or '>' for redirection
+  int type;          //  ' ' (exec), | (pipe), '<' or '>' for redirection, ';', 'a' (&&), 'o' (||) for sequence
 };
 
 struct execcmd {
@@ -34,7 +34,7 @@ struct redircmd {
 };
 
 struct pipecmd {
-  int type;          // |, ;
+  int type;          // |, ;, a(&&), o(||)
   struct cmd *left;  // left side of pipe
   struct cmd *right; // right side of pipe
 };
@@ -90,7 +90,7 @@ void runcmd(struct cmd *cmd) {
     ecmd = (struct execcmd*)cmd;
     // fprintf(stderr, "executing: %s\n", ecmd->argv[0]);
     if(ecmd->argv[0] == 0){
-      fprintf(stderr, "null command");
+      fprintf(stderr, "null command\n");
       exit(0);
     }
     run_exec(ecmd->argv);
@@ -139,14 +139,23 @@ void runcmd(struct cmd *cmd) {
     }
     wait(&r);
     break;
+  case 'a':
+  case 'o':
   case ';':
     pcmd = (struct pipecmd*)cmd;
     // fprintf(stderr, "left: %s right %s\n", ((struct execcmd*)pcmd->left)->argv[0], ((struct execcmd*)pcmd->right)->argv[0]);
     if(fork1() == 0){
       runcmd(pcmd->left);
     }else{
-      wait(&r);
-      runcmd(pcmd->right);
+      int success = wait(&r) >= 0 && WIFEXITED(r) && WEXITSTATUS(r) == 0;
+      // fprintf(stderr, "exit: %d | run right: %d\n", success, success == (cmd->type == 'a') || cmd->type == ';');
+      if(success == (cmd->type == 'a') || cmd->type == ';')
+        runcmd(pcmd->right);
+      else
+      {
+        exit(1);
+      }
+      
     }
     break;
   }    
@@ -167,7 +176,7 @@ int main(void) {
   }
 
   static char buf[MAXCHAR];
-  int fd = 0;
+  // int fd = 0;
   int r = 0;
 
   // Read and run input commands.
@@ -219,16 +228,17 @@ struct cmd* redircmd(struct cmd *subcmd, char *file, int type) {
 struct cmd* pipecmd(struct cmd *left, struct cmd *right, char type) {
   struct pipecmd *cmd = malloc(sizeof(*cmd));
   memset(cmd, 0, sizeof(*cmd));
-  cmd->type = type;
+  cmd->type = type == '&' ? 'a' : (type == '|' ? 'o' : type);
   cmd->left = left;
   cmd->right = right;
   return (struct cmd*)cmd;
 }
 
 // Parsing
-
 char whitespace[] = " \t\r\n\v";
-char symbols[] = "<|>\"'`;";
+char symbols[] = "<|&>\"'`;";
+const int pipe_symbol_count = 4;
+char* pipe_symbols[pipe_symbol_count] = {"&&", "||", ";", "|"}; // ordered by priority '||' > '|'
 
 // skips whitespace, finds token start, end (and start of next token if q / eq is specified)
  // return is either 0, a symbol or 'a' for non-symbol
@@ -256,24 +266,29 @@ int gettoken(char **ps, char *es, char **q, char **eq) {
   case 0:
     break;
   
-  case ')':
-  case ']':
-  case '}':
-    fprintf(stderr, "unbalanced brackets: '%c'\n", *s);
-    exit(1);
-    break;
+  // case ')':
+  // case ']':
+  // case '}':
+  //   fprintf(stderr, "unbalanced brackets: '%c'\n", *s);
+  //   exit(1);
+  //   break;
   
   // first char is a symbol
   case '|':
+  case '&':
+    // handling '&&' and '||'
+    s++;
+    if(s >= es || *s != *(s - 1))
+      break;
   case ';':
   case '<':
   case '>':
     s++;
     break;
-  // first char is a quote
   // case '[':
   // case '(':
   // case '{':
+  // first char is a quote
   case '"':
   case '\'':
   case '`':
@@ -323,12 +338,28 @@ int gettoken(char **ps, char *es, char **q, char **eq) {
 }
 
 // skips white space then returns if one of the tokens exist
-char* peek_tokens(char **ps, char *es, char *toks) {
+char* peek_char_tokens(char **ps, char *es, char *toks) {
   char *s = *ps;
   while(s < es && strchr(whitespace, *s))
     s++;
   *ps = s;
   return (*s) ? strchr(toks, *s) : 0;
+}
+
+// skips white space then returns if one of the tokens exist
+char* peek_tokens(char **ps, char *es, char** toks, int toks_len) {
+  char *s = *ps;
+  while(s < es && strchr(whitespace, *s))
+    s++;
+  *ps = s;
+  for(int i = 0; i < toks_len; i++){
+    int tok_len = strlen(toks[i]);
+    if(strncmp(s, toks[i], tok_len) == 0){
+      // (*ps) += tok_len - 1;
+      return s;
+    }
+  }
+  return 0;
 }
 
 struct cmd *parseline(char**, char*);
@@ -349,7 +380,7 @@ char *mkcopy(char *s, char *es) {
 struct cmd* parsecmd(char *s) {
   char *es = s + strlen(s);
   struct cmd *cmd = parseline(&s, es);
-  peek_tokens(&s, es, "");
+  peek_char_tokens(&s, es, "");
   if(s != es){
     fprintf(stderr, "leftovers: %s\n", s);
     exit(-1);
@@ -358,13 +389,15 @@ struct cmd* parsecmd(char *s) {
 }
 
 struct cmd* parseline(char **ps, char *es) {
+  // fprintf(stderr, "check line!\n");
   struct cmd *cmd = parsepipe(ps, es);
   return cmd;
 }
 
 struct cmd* parsepipe(char **ps, char *es) {
   struct cmd *cmd = parseexec(ps, es);
-  char* type = peek_tokens(ps, es, "|;");
+  char* type = peek_tokens(ps, es, pipe_symbols, pipe_symbol_count);
+
   if(type){
     gettoken(ps, es, 0, 0);
     cmd = pipecmd(cmd, parsepipe(ps, es), *type);
@@ -375,7 +408,7 @@ struct cmd* parsepipe(char **ps, char *es) {
 struct cmd* parseredirs(struct cmd *cmd, char **ps, char *es) {
   char *q = 0, *eq = 0;
 
-  while(peek_tokens(ps, es, "<>")){
+  while(peek_char_tokens(ps, es, "<>")){
     int tok = gettoken(ps, es, 0, 0);
     if(gettoken(ps, es, &q, &eq) != 'a') {
       fprintf(stderr, "missing file for redirection\n");
@@ -400,8 +433,10 @@ struct cmd* parseexec(char **ps, char *es) {
   struct cmd *ret = execcmd();
   struct execcmd *cmd = (struct execcmd*)ret;
 
+  // fprintf(stderr, "EXEC: %s\n", *ps);
+
   ret = parseredirs(ret, ps, es);
-  while(!peek_tokens(ps, es, "|;")){
+  while(!peek_tokens(ps, es, pipe_symbols, pipe_symbol_count)){
     if((tok=gettoken(ps, es, &q, &eq)) == 0)
       break;
     // fprintf(stderr, "exec token: '%.*s'\n", (int)(eq - q), q);
